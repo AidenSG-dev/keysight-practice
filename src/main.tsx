@@ -1,140 +1,65 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { AudioLines, ChevronDown, CircleHelp, Headphones, Mic, MicOff, Play, RotateCcw, Settings2, Sparkles, TimerReset, Waves, Zap } from 'lucide-react';
+import { AudioLines, CircleHelp, Maximize, Mic, MicOff, Pause, Play, RotateCcw, Settings2, Sparkles, TimerReset, Waves, Zap } from 'lucide-react';
 import './styles.css';
 
-type Rhythm = 'MINIM' | 'CROTCHET' | 'QUAVER';
-type Note = { name: string; midi: number; accidental?: string; rhythm: Rhythm };
-
-const NOTES = [
-  ['C4', 60], ['D4', 62], ['E4', 64], ['F4', 65], ['G4', 67], ['A4', 69], ['B4', 71],
-  ['C5', 72], ['D5', 74], ['E5', 76], ['F5', 77], ['G5', 79], ['A5', 81], ['B5', 83],
-] as const;
-const tempos = [80, 90, 100, 110, 120];
-const rhythmUnits: Record<Rhythm, number> = { MINIM: 2, CROTCHET: 1, QUAVER: 0.5 };
-const rhythmGlyph: Record<Rhythm, string> = { MINIM: '—', CROTCHET: '●', QUAVER: '◖' };
+type Rhythm = 'MINIM' | 'CROTCHET' | 'DOUBLE_QUAVER' | 'QUAVER_RUN';
+type NoteName = 'C4'|'D4'|'E4'|'F4'|'G4'|'A4'|'B4'|'C5';
+type NoteEvent = { id: string; name: NoteName; midi: number; rhythm: Rhythm; startBeat: number; duration: number; passed?: boolean; failed?: boolean };
+const NOTE_DATA: Record<NoteName, number> = { C4: 60, D4: 62, E4: 64, F4: 65, G4: 67, A4: 69, B4: 71, C5: 72 };
+const NOTE_ORDER: NoteName[] = ['C4','D4','E4','F4','G4','A4','B4','C5'];
+const TEMPOS = [80, 90, 100, 110, 120];
+const RHYTHM_GLYPH: Record<Rhythm, string> = { MINIM: '𝅗𝅥', CROTCHET: '♩', DOUBLE_QUAVER: '♫', QUAVER_RUN: '♬' };
+const RHYTHM_LABEL: Record<Rhythm, string> = { MINIM: 'MINIM', CROTCHET: 'CROTCHET', DOUBLE_QUAVER: 'DOUBLE QUAVER', QUAVER_RUN: '4× QUAVER RUN' };
+const SESSION_OPTIONS = [5, 10, 15, 20, 25, 30];
 
 function midiToFrequency(midi: number) { return 440 * Math.pow(2, (midi - 69) / 12); }
-function midiToNote(midi: number) {
-  const names = ['C', 'C♯', 'D', 'D♯', 'E', 'F', 'F♯', 'G', 'G♯', 'A', 'A♯', 'B'];
-  return `${names[midi % 12]}${Math.floor(midi / 12) - 1}`;
+function midiToNote(midi: number): NoteName | null { const hit = NOTE_ORDER.find((name) => NOTE_DATA[name] === midi); return hit ?? null; }
+function makeBar(bar: number): NoteEvent[] {
+  const difficulty = Math.min(4, Math.floor(bar / 2));
+  const patterns: Rhythm[][] = [
+    ['CROTCHET','CROTCHET','CROTCHET','CROTCHET'],
+    ['MINIM','CROTCHET','CROTCHET'],
+    ['DOUBLE_QUAVER','DOUBLE_QUAVER','CROTCHET','CROTCHET'],
+    ['CROTCHET','DOUBLE_QUAVER','DOUBLE_QUAVER','CROTCHET'],
+    ['QUAVER_RUN','QUAVER_RUN'],
+  ];
+  const pattern = patterns[difficulty]; let beat = 0;
+  return pattern.map((rhythm, index) => { const duration = rhythm === 'MINIM' ? 2 : rhythm === 'CROTCHET' ? 1 : rhythm === 'DOUBLE_QUAVER' ? 1 : 2; const note = NOTE_ORDER[(Math.floor(Math.random() * NOTE_ORDER.length) + bar + index * 2) % NOTE_ORDER.length]; const item = { id: `${bar}-${index}-${Math.random()}`, name: note, midi: NOTE_DATA[note], rhythm, startBeat: beat, duration }; beat += duration; return item; });
 }
-function centsOff(freq: number, target: number) { return 1200 * Math.log2(freq / target); }
+function noteY(name: NoteName) { const positions: Record<NoteName, number> = { C4: 175, D4: 150, E4: 125, F4: 100, G4: 75, A4: 50, B4: 25, C5: 0 }; return positions[name]; }
 
 function App() {
-  const [tempo, setTempo] = useState(100);
-  const [isRunning, setIsRunning] = useState(false);
-  const [sequence, setSequence] = useState<Note[]>([]);
-  const [currentIndex, setCurrentIndex] = useState(0);
-  const [lastPlayed, setLastPlayed] = useState('—');
-  const [lastResult, setLastResult] = useState<'waiting' | 'accurate' | 'missed'>('waiting');
-  const [practiceCount, setPracticeCount] = useState(0);
-  const [accurateCount, setAccurateCount] = useState(0);
-  const [micOn, setMicOn] = useState(false);
-  const [micStatus, setMicStatus] = useState('Microphone inactive');
-  const [detectedNote, setDetectedNote] = useState('—');
-  const [detectedCents, setDetectedCents] = useState(0);
-  const [soundOn, setSoundOn] = useState(true);
-  const audioRef = useRef<AudioContext | null>(null);
-  const oscillatorRef = useRef<OscillatorNode | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const rafRef = useRef<number | null>(null);
-
-  const nextSequence = useCallback(() => {
-    const shuffled = [...NOTES].sort(() => Math.random() - 0.5).slice(0, 8);
-    const rhythms: Rhythm[] = ['CROTCHET', 'QUAVER', 'CROTCHET', 'MINIM', 'QUAVER', 'CROTCHET', 'MINIM', 'QUAVER'];
-    setSequence(shuffled.map(([name, midi], i) => ({ name, midi, rhythm: rhythms[i] })));
-    setCurrentIndex(0); setPracticeCount(0); setAccurateCount(0); setLastPlayed('—'); setLastResult('waiting');
-  }, []);
-  useEffect(() => { nextSequence(); }, [nextSequence]);
-  const current = sequence[currentIndex];
-  const score = practiceCount ? Math.round((accurateCount / practiceCount) * 100) : 0;
-  const readiness = Math.min(100, Math.round(score * 0.7 + Math.min(practiceCount, 12) / 12 * 30));
-  const readinessLabel = readiness >= 82 ? 'Ready to layer chords' : readiness >= 60 ? 'Build more consistency' : 'Keep training single notes';
-
-  const playTone = useCallback((midi: number) => {
-    if (!soundOn) return;
-    const ctx = audioRef.current ?? new AudioContext(); audioRef.current = ctx;
-    oscillatorRef.current?.stop();
-    const osc = ctx.createOscillator(); const gain = ctx.createGain();
-    osc.type = 'sine'; osc.frequency.value = midiToFrequency(midi); gain.gain.setValueAtTime(0.0001, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.12, ctx.currentTime + 0.01); gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.7);
-    osc.connect(gain).connect(ctx.destination); osc.start(); osc.stop(ctx.currentTime + 0.72); oscillatorRef.current = osc;
-  }, [soundOn]);
-
-  const registerNote = useCallback((name: string, midi: number) => {
-    if (!current || !isRunning) return;
-    playTone(midi);
-    const correct = midi === current.midi;
-    setLastPlayed(name); setLastResult(correct ? 'accurate' : 'missed'); setPracticeCount((x) => x + 1); if (correct) setAccurateCount((x) => x + 1);
-    setCurrentIndex((x) => (x + 1) % sequence.length);
-  }, [current, isRunning, playTone, sequence.length]);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const found = NOTES.find(([name]) => name.toLowerCase() === e.key.toLowerCase());
-      if (found) registerNote(found[0], found[1]);
-    };
-    window.addEventListener('keydown', onKey); return () => window.removeEventListener('keydown', onKey);
-  }, [registerNote]);
-
-  const startMic = async () => {
-    if (micOn) { streamRef.current?.getTracks().forEach((t) => t.stop()); if (rafRef.current) cancelAnimationFrame(rafRef.current); setMicOn(false); setMicStatus('Microphone inactive'); setDetectedNote('—'); return; }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, autoGainControl: false, noiseSuppression: false } });
-      streamRef.current = stream; const ctx = audioRef.current ?? new AudioContext(); audioRef.current = ctx;
-      const source = ctx.createMediaStreamSource(stream); const analyser = ctx.createAnalyser(); analyser.fftSize = 2048; source.connect(analyser); analyserRef.current = analyser;
-      setMicOn(true); setMicStatus('Listening for acoustic pitch');
-      const buffer = new Float32Array(analyser.fftSize);
-      const detect = () => {
-        analyser.getFloatTimeDomainData(buffer); let rms = 0; for (const v of buffer) rms += v * v; rms = Math.sqrt(rms / buffer.length);
-        if (rms > 0.012) {
-          let bestLag = 0; let best = 0;
-          for (let lag = 24; lag < 180; lag++) { let corr = 0; for (let i = 0; i < buffer.length - lag; i += 2) corr += buffer[i] * buffer[i + lag]; if (corr > best) { best = corr; bestLag = lag; } }
-          if (bestLag) { const freq = ctx.sampleRate / bestLag; const midi = Math.round(69 + 12 * Math.log2(freq / 440)); const cents = Math.max(-50, Math.min(50, Math.round(centsOff(freq, midiToFrequency(midi))))); const note = midiToNote(midi); setDetectedNote(note); setDetectedCents(cents); if (current && Math.abs(midi - current.midi) <= 0) registerNote(note, midi); }
-        }
-        rafRef.current = requestAnimationFrame(detect);
-      }; detect();
-    } catch { setMicStatus('Permission needed — allow microphone access'); }
-  };
-
-  const beatMs = 60000 / tempo;
-  useEffect(() => { if (!isRunning) return; const id = window.setInterval(() => {}, beatMs); return () => clearInterval(id); }, [isRunning, beatMs]);
-
-  const keyboard = useMemo(() => NOTES.map(([name, midi]) => ({ name, midi, black: name.includes('♯') })), []);
-  return <div className="app-shell">
-    <aside className="sidebar">
-      <div className="brand"><div className="brand-mark"><Waves size={19} /></div><div><div className="brand-name">KEYSIGHT</div><div className="brand-sub">practice studio</div></div></div>
-      <div className="side-label">TRAINING MODE</div>
-      <button className="nav-item active"><Zap size={17} /> Sight-reading <span className="nav-dot" /></button>
-      <button className="nav-item"><AudioLines size={17} /> Chord fluency <span className="soon">soon</span></button>
-      <button className="nav-item"><TimerReset size={17} /> Session history</button>
-      <div className="sidebar-spacer" />
-      <div className="micro-card"><div className="side-label">TODAY'S TARGET</div><div className="target-row"><span>12 min</span><span>07:42</span></div><div className="target-track"><span /></div><p>One focused block beats scattered practice.</p></div>
-      <button className="nav-item"><Settings2 size={17} /> Preferences</button>
-    </aside>
-    <main className="main-content">
-      <header className="topbar"><div><div className="eyebrow">SIGHT-READING / SESSION 04</div><h1>Single notes, instantly.</h1></div><div className="top-actions"><button className="icon-btn" title="Help"><CircleHelp size={18} /></button><div className="avatar">AR</div></div></header>
-      <section className="session-grid">
-        <div className="practice-card">
-          <div className="card-head"><div><div className="card-kicker">LIVE EXERCISE</div><h2>Find the note. Stay in time.</h2></div><div className={`status-pill ${isRunning ? 'live' : ''}`}><span />{isRunning ? 'running' : 'paused'}</div></div>
-          <div className="staff-wrap"><div className="staff-meta"><span>Treble clef · C position</span><span className="measure">MEASURE {String(currentIndex + 1).padStart(2, '0')} / 08</span></div><div className="staff"><div className="clef">𝄞</div><div className="staff-lines">{[0,1,2,3,4].map((x) => <span key={x} />)}<div className="note-head" style={{ top: `${current ? 54 - (current.midi - 60) * 3.5 : 48}px` }}><i /><b /></div></div><div className="barline" /></div><div className="note-readout"><div className="note-symbol">{current ? current.name.replace(/[0-9]/, '') : '—'}</div><div><div className="note-name">{current?.name ?? '—'}</div><div className="note-rhythm">{current ? `${rhythmGlyph[current.rhythm]} ${current.rhythm}` : 'Waiting'}</div></div><div className="next-hint">NEXT <strong>{sequence[(currentIndex + 1) % Math.max(sequence.length, 1)]?.name ?? '—'}</strong></div></div></div>
-          <div className="control-row"><div className="tempo-control"><span className="control-label">TEMPO</span><div className="tempo-value">{tempo}<small>BPM</small></div><div className="tempo-buttons">{tempos.map((t) => <button key={t} className={tempo === t ? 'selected' : ''} onClick={() => setTempo(t)}>{t}</button>)}</div></div><div className="transport"><button className={`primary-btn ${isRunning ? 'pause' : ''}`} onClick={() => setIsRunning((x) => !x)}><Play size={16} fill="currentColor" /> {isRunning ? 'Pause drill' : 'Start drill'}</button><button className="secondary-btn" onClick={nextSequence}><RotateCcw size={16} /> New sequence</button></div></div>
-          <div className="sequence-strip"><span className="control-label">UP NEXT</span>{sequence.map((note, i) => <span key={`${note.name}-${i}`} className={`seq-note ${i === currentIndex ? 'current' : i < currentIndex ? 'done' : ''}`}>{note.name.replace(/[0-9]/, '')}<small>{rhythmGlyph[note.rhythm]}</small></span>)}</div>
-        </div>
-        <div className="side-stack">
-          <div className="metric-card"><div className="metric-top"><span className="card-kicker">READINESS MODEL</span><span className="model-badge">R2</span></div><div className="readiness-number">{readiness}<span>/100</span></div><div className="readiness-label">{readinessLabel}</div><div className="readiness-track"><span style={{ width: `${readiness}%` }} /></div><div className="model-copy">Accuracy, tempo control, and consistency are weighted toward chord readiness.</div></div>
-          <div className="metric-card mic-card"><div className="metric-top"><span className="card-kicker">AUDIO INPUT</span><span className={`input-state ${micOn ? 'on' : ''}`}><span />{micOn ? 'live' : 'offline'}</span></div><div className="pitch-display"><div className="pitch-note">{detectedNote}</div><div className="pitch-cents"><span className={detectedCents === 0 ? 'centered' : ''}>{detectedCents > 0 ? '+' : ''}{detectedCents} cents</span><div className="cents-meter"><i /><b style={{ left: `${50 + detectedCents / 2}%` }} /></div></div></div><button className={`mic-btn ${micOn ? 'active' : ''}`} onClick={startMic}>{micOn ? <MicOff size={16} /> : <Mic size={16} />} {micOn ? 'Stop listening' : 'Enable microphone'}</button><div className="mic-status">{micOn && <span className="pulse-dot" />}{micStatus}</div></div>
-        </div>
-      </section>
-      <section className="lower-grid">
-        <div className="keyboard-card"><div className="card-head compact"><div><div className="card-kicker">MIDI / ACOUSTIC MONITOR</div><h2>Play the highlighted key</h2></div><button className={`sound-toggle ${soundOn ? 'on' : ''}`} onClick={() => setSoundOn((x) => !x)}>{soundOn ? 'Sound on' : 'Sound off'}</button></div><div className="keyboard"><div className="white-keys">{keyboard.filter((k) => !k.black).map((key) => <button key={key.midi} className={current?.midi === key.midi ? 'target-key' : ''} onClick={() => registerNote(key.name, key.midi)}><span>{key.name.replace(/[0-9]/, '')}</span></button>)}</div><div className="black-keys">{keyboard.filter((k) => k.black).map((key) => <button key={key.midi} onClick={() => registerNote(key.name, key.midi)}><span>{key.name.replace(/[0-9]/, '')}</span></button>)}</div></div><div className="keyboard-foot"><span><span className="legend-dot target" /> target</span><span><span className="legend-dot pressed" /> last played: <strong className={lastResult}>{lastPlayed}</strong></span><span className="keyboard-tip">Computer keys A–K also work</span></div></div>
-        <div className="stats-card"><div className="card-kicker">SESSION SIGNALS</div><div className="stat-list"><div><span>Accuracy</span><strong>{score}%</strong></div><div><span>Notes attempted</span><strong>{practiceCount || 0}</strong></div><div><span>Tempo lock</span><strong>{tempo} BPM</strong></div><div><span>Rhythms</span><strong>3 patterns</strong></div></div><div className="rhythm-legend"><span><b>—</b> minim</span><span><b>●</b> crotchet</span><span><b>◖</b> quaver</span></div></div>
-      </section>
-      <div className="footer-note"><Sparkles size={14} /> Play by ear, verify by sight, build toward chords. <span>Each correct note advances the phrase.</span></div>
-    </main>
-  </div>;
+  const [tempo, setTempo] = useState(100); const [sessionBars, setSessionBars] = useState(10); const [sessionStarted, setSessionStarted] = useState(false); const [running, setRunning] = useState(false); const [countIn, setCountIn] = useState(0); const [barNumber, setBarNumber] = useState(1); const [bar, setBar] = useState<NoteEvent[]>(() => makeBar(0)); const [beatPosition, setBeatPosition] = useState(0); const [detectedNote, setDetectedNote] = useState<NoteName | null>(null); const [micOn, setMicOn] = useState(false); const [micStatus, setMicStatus] = useState('Microphone inactive'); const [heldKeys, setHeldKeys] = useState<Set<string>>(new Set()); const [message, setMessage] = useState('Choose a session length to begin'); const [passed, setPassed] = useState(0); const [missed, setMissed] = useState(0); const [soundOn, setSoundOn] = useState(true); const [lastResult, setLastResult] = useState<'waiting'|'correct'|'missed'>('waiting');
+  const audioRef = useRef<AudioContext | null>(null); const metronomeRef = useRef<number | null>(null); const tickRef = useRef<number | null>(null); const phaseStartRef = useRef(performance.now()); const barRef = useRef(bar); const barNumberRef = useRef(barNumber); const countRef = useRef(countIn); const runRef = useRef(running); const heldRef = useRef(heldKeys); const heldSinceRef = useRef(new Map<string, number>()); const detectedRef = useRef(detectedNote); const analyserRef = useRef<AnalyserNode | null>(null); const streamRef = useRef<MediaStream | null>(null); const rafRef = useRef<number | null>(null); const micMatchSince = useRef<number | null>(null); const playedEvents = useRef(new Set<string>());
+  useEffect(() => { barRef.current = bar; }, [bar]); useEffect(() => { barNumberRef.current = barNumber; }, [barNumber]); useEffect(() => { countRef.current = countIn; }, [countIn]); useEffect(() => { runRef.current = running; }, [running]); useEffect(() => { heldRef.current = heldKeys; }, [heldKeys]); useEffect(() => { detectedRef.current = detectedNote; }, [detectedNote]);
+  const ensureAudio = useCallback(() => { const ctx = audioRef.current ?? new AudioContext(); audioRef.current = ctx; if (ctx.state === 'suspended') void ctx.resume(); return ctx; }, []);
+  const tone = useCallback((frequency: number, length = .07, volume = .12) => { if (!soundOn) return; const ctx = ensureAudio(); const osc = ctx.createOscillator(); const gain = ctx.createGain(); osc.type = 'square'; osc.frequency.value = frequency; gain.gain.setValueAtTime(volume, ctx.currentTime); gain.gain.exponentialRampToValueAtTime(.0001, ctx.currentTime + length); osc.connect(gain).connect(ctx.destination); osc.start(); osc.stop(ctx.currentTime + length); }, [ensureAudio, soundOn]);
+  const startSession = async () => { try { await document.documentElement.requestFullscreen?.(); } catch { /* fullscreen requires a browser gesture; the drill still starts */ } ensureAudio(); phaseStartRef.current = performance.now(); setSessionStarted(true); setRunning(true); setCountIn(4); setBarNumber(1); setBar(makeBar(0)); setBeatPosition(0); setPassed(0); setMissed(0); setMessage('READY? Listen for the four-count lead-in.'); };
+  const stopSession = () => { setRunning(false); setSessionStarted(false); setCountIn(0); setMessage('Session paused — choose a new length or resume.'); };
+  const exitSession = () => { stopSession(); if (document.fullscreenElement) void document.exitFullscreen?.(); };
+  const beginBar = useCallback(() => { phaseStartRef.current = performance.now(); setBar(makeBar(barNumberRef.current - 1)); setBeatPosition(0); setCountIn(0); setMessage('PLAY — stay with the green beat dots'); playedEvents.current.clear(); }, []);
+  const completeBar = useCallback(() => { const finished = barRef.current; const good = finished.filter((x) => x.passed).length; const bad = finished.length - good; setPassed((x) => x + good); setMissed((x) => x + bad); if (barNumberRef.current >= sessionBars) { setRunning(false); setMessage(`SESSION COMPLETE — ${good} correct events in the final bar.`); return; } const next = barNumberRef.current + 1; setBarNumber(next); setBar(makeBar(next - 1)); phaseStartRef.current = performance.now(); setBeatPosition(0); setCountIn(4); setMessage(`BAR ${barNumberRef.current} COMPLETE — next bar is harder.`); playedEvents.current.clear(); }, [sessionBars]);
+  const evaluateEvent = useCallback((event: NoteEvent) => { if (playedEvents.current.has(event.id)) return; playedEvents.current.add(event.id); const requiredMs = event.duration * (60000 / tempo) * .72; const keyHeld = heldRef.current.has(event.name) && performance.now() - (heldSinceRef.current.get(event.name) ?? performance.now()) >= requiredMs; const micHeld = detectedRef.current === event.name && micMatchSince.current !== null && performance.now() - micMatchSince.current >= requiredMs; const isGood = keyHeld || micHeld; setBar((items) => items.map((x) => x.id === event.id ? { ...x, passed: isGood, failed: !isGood } : x)); setLastResult(isGood ? 'correct' : 'missed'); }, [tempo]);
+  useEffect(() => { if (!running) return; const beatMs = 60000 / tempo; let lastBeat = -1; const tick = () => { if (!runRef.current) return; const elapsed = performance.now() - phaseStartRef.current; const totalBeats = elapsed / beatMs; const beat = Math.floor(totalBeats); const position = totalBeats % 4; setBeatPosition(position); if (beat !== lastBeat) { lastBeat = beat; tone(beat === 0 ? 880 : 660, .08, .07); if (countRef.current > 0) { setCountIn((x) => { const next = x - 1; if (next === 0) setTimeout(beginBar, 0); return next; }); } else { barRef.current.filter((event) => event.startBeat + event.duration <= position + .03).forEach(evaluateEvent); if (beat === 4) completeBar(); } } tickRef.current = requestAnimationFrame(tick); }; tickRef.current = requestAnimationFrame(tick); return () => { if (tickRef.current) cancelAnimationFrame(tickRef.current); }; }, [running, tempo, tone, beginBar, completeBar, evaluateEvent]);
+  useEffect(() => { const down = (event: KeyboardEvent) => { const map: Record<string, NoteName> = { a:'C4', s:'D4', d:'E4', f:'F4', g:'G4', h:'A4', j:'B4', k:'C5' }; const note = map[event.key.toLowerCase()]; if (!note || event.repeat) return; heldSinceRef.current.set(note, performance.now()); setHeldKeys((current) => new Set(current).add(note)); }; const up = (event: KeyboardEvent) => { const map: Record<string, NoteName> = { a:'C4', s:'D4', d:'E4', f:'F4', g:'G4', h:'A4', j:'B4', k:'C5' }; const note = map[event.key.toLowerCase()]; if (!note) return; heldSinceRef.current.delete(note); setHeldKeys((current) => { const next = new Set(current); next.delete(note); return next; }); }; window.addEventListener('keydown', down); window.addEventListener('keyup', up); return () => { window.removeEventListener('keydown', down); window.removeEventListener('keyup', up); }; }, []);
+  const startMic = async () => { if (micOn) { streamRef.current?.getTracks().forEach((t) => t.stop()); if (rafRef.current) cancelAnimationFrame(rafRef.current); setMicOn(false); setMicStatus('Microphone inactive'); setDetectedNote(null); return; } try { const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, autoGainControl: false, noiseSuppression: false, channelCount: 1 } }); streamRef.current = stream; const ctx = ensureAudio(); const source = ctx.createMediaStreamSource(stream); const analyser = ctx.createAnalyser(); analyser.fftSize = 4096; analyser.smoothingTimeConstant = .15; source.connect(analyser); analyserRef.current = analyser; setMicOn(true); setMicStatus('Listening for sustained piano pitch'); const buffer = new Float32Array(analyser.fftSize); const detect = () => { analyser.getFloatTimeDomainData(buffer); let rms = 0; for (const sample of buffer) rms += sample * sample; rms = Math.sqrt(rms / buffer.length); if (rms > .015) { let bestLag = -1; let bestCorr = 0; for (let lag = 40; lag < 520; lag++) { let corr = 0; for (let i = 0; i < buffer.length - lag; i += 4) corr += buffer[i] * buffer[i + lag]; if (corr > bestCorr) { bestCorr = corr; bestLag = lag; } } if (bestLag > 0 && bestCorr > .8) { const midi = Math.round(69 + 12 * Math.log2((ctx.sampleRate / bestLag) / 440)); const note = midiToNote(midi); if (note) { setDetectedNote(note); if (detectedRef.current !== note) micMatchSince.current = performance.now(); } } } else { setDetectedNote(null); micMatchSince.current = null; } rafRef.current = requestAnimationFrame(detect); }; detect(); } catch { setMicStatus('Permission needed — allow microphone access'); } };
+  const pressKey = (name: NoteName) => { setHeldKeys((current) => new Set(current).add(name)); window.setTimeout(() => setHeldKeys((current) => { const next = new Set(current); next.delete(name); return next; }), 180); };
+  const currentTarget = bar.find((event) => beatPosition >= event.startBeat && beatPosition < event.startBeat + event.duration);
+  const totalEvents = passed + missed; const score = totalEvents ? Math.round((passed / totalEvents) * 100) : 0; const readiness = Math.min(100, Math.round(score * .75 + Math.min(barNumber, 10) * 2.5));
+  const keyboard = useMemo(() => NOTE_ORDER.map((name) => ({ name, midi: NOTE_DATA[name] })), []);
+  return <div className={`app-shell ${sessionStarted ? 'session-mode' : ''}`}>
+    <aside className="sidebar"><div className="brand"><div className="brand-mark"><Waves size={19} /></div><div><div className="brand-name">KEYSIGHT</div><div className="brand-sub">practice studio</div></div></div><div className="side-label">TRAINING MODE</div><button className="nav-item active"><Zap size={17} /> Sight-reading <span className="nav-dot" /></button><button className="nav-item"><AudioLines size={17} /> Chord fluency <span className="soon">NEXT</span></button><button className="nav-item"><TimerReset size={17} /> Session history</button><div className="sidebar-spacer" /><div className="micro-card"><div className="side-label">SESSION TARGET</div><div className="target-row"><span>{sessionBars} bars</span><span>{tempo} BPM</span></div><div className="target-track"><span style={{ width: `${Math.min(100, (barNumber / sessionBars) * 100)}%` }} /></div><p>Bar {barNumber} of {sessionBars}. Complexity rises every two bars.</p></div><button className="nav-item"><Settings2 size={17} /> Preferences</button></aside>
+    <main className="main-content"><header className="topbar"><div><div className="eyebrow">SIGHT-READING / {sessionStarted ? 'LIVE SESSION' : 'SESSION SETUP'}</div><h1>Single notes, instantly.</h1></div><div className="top-actions"><button className="icon-btn" title="Help"><CircleHelp size={18} /></button><button className="icon-btn" title="Fullscreen" onClick={() => void document.documentElement.requestFullscreen?.()}><Maximize size={17} /></button><div className="avatar">AR</div></div></header>
+      {!sessionStarted && <section className="setup-card"><div className="setup-copy"><div className="card-kicker">SESSION LENGTH</div><h2>How hard are you willing to work?</h2><p>Every bar gets denser. Four beats of count-in before every new bar. Hold each note through its timed window.</p></div><div className="option-grid">{SESSION_OPTIONS.map((bars) => <button key={bars} className={bars === sessionBars ? 'selected' : ''} onClick={() => setSessionBars(bars)}><strong>{bars}</strong><span>BARS</span></button>)}</div><div className="setup-bottom"><div className="setup-facts"><span><b>8</b> notes · C4–C5</span><span><b>4</b> count-in beats</span><span><b>3+</b> rhythm tiers</span></div><button className="primary-btn start-session" onClick={startSession}><Play size={16} fill="currentColor" /> Start {sessionBars}-bar session</button></div></section>}
+      <section className="session-grid"><div className="practice-card"><div className="card-head"><div><div className="card-kicker">{sessionStarted ? 'LIVE EXERCISE' : 'PREVIEW'}</div><h2>{message}</h2></div><div className={`status-pill ${running ? 'live' : ''}`}><span />{running ? 'running' : 'paused'}</div></div>
+        <div className="session-indicator"><div className="indicator-item"><span className="indicator-label">TEMPO</span><strong>{tempo}<small>BPM</small></strong></div><div className="indicator-item"><span className="indicator-label">BAR</span><strong>{String(Math.min(barNumber, sessionBars)).padStart(2,'0')}<small>/{sessionBars}</small></strong></div><div className="beat-circles"><span className="indicator-label">BEAT</span><div>{[0,1,2,3].map((beat) => <i key={beat} className={countIn > 0 ? beat >= 4 - countIn ? 'active' : '' : Math.floor(beatPosition) === beat ? 'current' : beat < Math.floor(beatPosition) ? 'done' : ''}>{beat + 1}</i>)}</div></div><div className="audio-mini"><span className="indicator-label">AUDIO INPUT</span><strong className={detectedNote ? 'detected' : ''}>{detectedNote ?? '—'}</strong><span className={`live-label ${micOn ? 'on' : ''}`}><i />{micOn ? 'LIVE' : 'OFFLINE'}</span></div></div>
+        <div className="staff-wrap"><div className="staff-meta"><span>Treble staff · C4–C5 range</span><span className="measure">BAR {String(Math.min(barNumber, sessionBars)).padStart(2,'0')} / {sessionBars}</span></div><div className="staff"><div className="clef">𝄞</div><div className="staff-lines">{[0,1,2,3,4,5].map((line) => <span key={line} style={{ top: `${line * 25}px` }} />)}{bar.map((event) => <div key={event.id} className={`staff-note ${event.passed ? 'passed' : ''} ${event.failed ? 'failed' : ''} ${currentTarget?.id === event.id ? 'active-note' : ''}`} style={{ left: `${8 + (event.startBeat / 4) * 84}%`, top: `${noteY(event.name)}px` }} title={`${event.name} · ${RHYTHM_LABEL[event.rhythm]}`}><i /><b /><em>{RHYTHM_GLYPH[event.rhythm]}</em></div>)}<div className="playhead" style={{ left: `${8 + (beatPosition / 4) * 84}%` }} /></div><div className="barline" /></div><div className="note-readout"><div className="note-symbol">{currentTarget ? currentTarget.name.replace(/[0-9]/,'') : '—'}</div><div><div className="note-name">{currentTarget?.name ?? 'Wait for the next beat'}</div><div className="note-rhythm">{currentTarget ? `${RHYTHM_GLYPH[currentTarget.rhythm]} ${RHYTHM_LABEL[currentTarget.rhythm]}` : 'The playhead reveals each note'}</div></div><div className="next-hint">TARGET <strong>{currentTarget?.name ?? '—'}</strong></div></div></div>
+        <div className="control-row"><div className="tempo-control"><span className="control-label">TEMPO</span><div className="tempo-buttons">{TEMPOS.map((t) => <button key={t} className={tempo === t ? 'selected' : ''} onClick={() => setTempo(t)}>{t}</button>)}</div></div><div className="transport">{sessionStarted && <button className={`primary-btn ${running ? 'pause' : ''}`} onClick={() => { if (!running) setRunning(true); else setRunning(false); }}><>{running ? <Pause size={16} fill="currentColor" /> : <Play size={16} fill="currentColor" />}</> {running ? 'Pause' : 'Resume'}</button>}<button className="secondary-btn" onClick={() => { setBar(makeBar(barNumber - 1)); setBeatPosition(0); setMessage('New bar ready — listen for count-in.'); }}><RotateCcw size={16} /> New bar</button></div></div>
+        <div className="sequence-strip"><span className="control-label">BAR EVENTS</span>{bar.map((event) => <span key={event.id} className={`seq-note ${currentTarget?.id === event.id ? 'current' : ''} ${event.passed ? 'done' : ''}`}>{event.name}<small>{RHYTHM_GLYPH[event.rhythm]}</small></span>)}</div></div>
+        <div className="side-stack"><div className="metric-card"><div className="metric-top"><span className="card-kicker">READINESS MODEL</span><span className="model-badge">R3</span></div><div className="readiness-number">{readiness}<span>/100</span></div><div className="readiness-label">{readiness >= 82 ? 'Ready to layer chords' : readiness >= 60 ? 'Build more consistency' : 'Keep training single notes'}</div><div className="readiness-track"><span style={{ width: `${readiness}%` }} /></div><div className="model-copy">Weights held-note accuracy, beat alignment, bar completion, and progressive tempo confidence.</div></div><div className="metric-card mic-card"><div className="metric-top"><span className="card-kicker">KEY RECOGNITION</span><span className={`input-state ${micOn ? 'on' : ''}`}><span />{micOn ? 'live' : 'offline'}</span></div><div className="pitch-display"><div className="pitch-note">{detectedNote ?? '—'}</div><div><div className="pitch-helper">Hold the target note until its window ends.</div><div className="hold-meter"><span style={{ width: `${detectedNote && currentTarget?.name === detectedNote ? 100 : 0}%` }} /></div></div></div><button className={`mic-btn ${micOn ? 'active' : ''}`} onClick={startMic}>{micOn ? <MicOff size={16} /> : <Mic size={16} />} {micOn ? 'Stop listening' : 'Enable microphone'}</button><div className="mic-status">{micOn && <span className="pulse-dot" />}{micStatus}</div></div></div></section>
+      <section className="lower-grid"><div className="keyboard-card"><div className="card-head compact"><div><div className="card-kicker">C4–C5 KEYBOARD MAP</div><h2>Hold the highlighted key</h2></div><button className={`sound-toggle ${soundOn ? 'on' : ''}`} onClick={() => setSoundOn((x) => !x)}>{soundOn ? 'Metronome + sound' : 'Sound off'}</button></div><div className="keyboard">{keyboard.map((key) => <button key={key.name} className={`${heldKeys.has(key.name) ? 'held' : ''} ${currentTarget?.name === key.name ? 'target-key' : ''}`} onMouseDown={() => pressKey(key.name)}><span>{key.name}</span></button>)}</div><div className="keyboard-foot"><span><span className="legend-dot target" /> target</span><span><span className={`legend-dot ${lastResult}`} /> last event: <strong className={lastResult}>{lastResult === 'waiting' ? 'waiting' : lastResult}</strong></span><span className="keyboard-tip">A–K computer keys map C4–C5</span></div></div><div className="stats-card"><div className="card-kicker">SESSION SIGNALS</div><div className="stat-list"><div><span>Accuracy</span><strong>{score}%</strong></div><div><span>Bars completed</span><strong>{Math.max(0, barNumber - (running ? 1 : 0))}/{sessionBars}</strong></div><div><span>Tempo lock</span><strong>{tempo} BPM</strong></div><div><span>Current difficulty</span><strong>{Math.min(5, Math.floor((barNumber - 1) / 2) + 1)}/5</strong></div></div><div className="rhythm-legend"><span><b>𝅗𝅥</b> minim · 2 beats</span><span><b>♩</b> crotchet · 1 beat</span><span><b>♫</b> double quaver · ½ + ½</span><span><b>♬</b> four-quaver run · advanced</span></div></div></section>
+      <div className="footer-note"><Sparkles size={14} /> {sessionStarted ? 'The green dots mark where your notes must land.' : 'Start a session in fullscreen for the most accurate timing.'} <span>{lastResult === 'correct' ? 'Last event held accurately.' : 'Accuracy is judged on pitch and beat window.'}</span></div>
+    </main></div>;
 }
-
 createRoot(document.getElementById('root')!).render(<App />);
